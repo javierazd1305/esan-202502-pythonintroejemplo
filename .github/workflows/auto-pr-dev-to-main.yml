@@ -2,7 +2,7 @@ name: Auto PR dev -> main (palabra PR)
 
 on:
   push:
-    branches: ["dev"]        # se dispara al pushear a dev
+    branches: ["dev", "DEV"]        # se dispara al pushear a dev
   workflow_dispatch: {}      # opcional: lanzarlo manualmente
 
 permissions:
