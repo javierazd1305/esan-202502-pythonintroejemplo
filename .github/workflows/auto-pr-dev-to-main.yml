@@ -1,50 +1,68 @@
-name: Auto PR -> main (requiere palabra PR)
+name: auto-pr-dev-to-main
 
 on:
   push:
     branches: ["dev", "DEV"]   # escucha ambas variantes
-  workflow_dispatch: {}        # permite correrlo manualmente
+  workflow_dispatch: {}
 
+# Requiere habilitar en Settings → Actions → Workflow permissions:
+#   - Read and write permissions
+#   - Allow GitHub Actions to create and approve pull requests
 permissions:
   contents: read
   pull-requests: write
 
+env:
+  BASE_BRANCH: main            # rama destino
+  KEYWORD: PR                  # palabra exacta requerida en mensajes de commit
+  MIN_AHEAD: "1"               # mínimo de commits que dev debe llevarle a main
+  PR_TITLE_PREFIX: "Promote"   # prefijo del título del PR
+  PR_LABELS: "auto-pr,release" # (opcional) etiquetas separadas por coma; vacío = ninguna
+  PR_REVIEWERS: ""             # (opcional) reviewers separados por coma; vacío = ninguno
+
 jobs:
-  auto-pr:
+  open-pr:
     runs-on: ubuntu-latest
     steps:
-      - name: Debug ref
-        run: |
-          echo "GITHUB_REF=$GITHUB_REF"
-          echo "GITHUB_REF_NAME=$GITHUB_REF_NAME"
+      - name: Debug (ref y últimos mensajes)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.info(`GITHUB_REF: ${process.env.GITHUB_REF}`);
+            core.info(`GITHUB_REF_NAME: ${process.env.GITHUB_REF_NAME}`);
+            const commits = context.payload.commits || [];
+            core.info("Mensajes del push:");
+            for (const c of commits) core.info(`- ${c.message}`);
 
-      - name: Gate por mensaje que contenga la palabra exacta PR
+      - name: Gate por palabra clave exacta
         id: gate
         uses: actions/github-script@v7
         with:
           script: |
             const commits = context.payload.commits || [];
-            const hit = commits.some(c => /\bPR\b/.test(c.message)); // sensible a mayúsculas
+            const regex = new RegExp(String.raw`\\b${process.env.KEYWORD}\\b`); // sensible a mayúsculas
+            const hit = commits.some(c => regex.test(c.message || ""));
             core.setOutput('open', hit ? 'true' : 'false');
-            core.info(`Gate (tiene PR?): ${hit}`);
+            core.info(`¿Contiene "${process.env.KEYWORD}"?: ${hit}`);
 
-      - name: Crear PR hacia main si pasa el gate
+      - name: Crear PR dev/DEV -> main (si pasa gate)
         if: steps.gate.outputs.open == 'true'
         uses: actions/github-script@v7
         with:
+          # Si tu organización no permite que GITHUB_TOKEN cree PRs,
+          # crea un PAT con scope repo y guárdalo como GH_PAT:
+          github-token: ${{ secrets.GH_PAT != '' && secrets.GH_PAT || github.token }}
           script: |
             const { owner, repo } = context.repo;
-            const base = "main";
-            // rama actual del push (p.ej., "DEV" o "dev")
-            const head = context.ref.replace('refs/heads/', '');
-            core.info(`Base=${base}  Head=${head}`);
+            const base = process.env.BASE_BRANCH || "main";
+            const head = context.ref.replace("refs/heads/", ""); // dev o DEV
 
             if (head.toLowerCase() === base.toLowerCase()) {
-              core.notice("Estás en main; no tiene sentido abrir PR.");
+              core.notice("Push en la rama base: no se crea PR.");
               return;
             }
 
-            // ¿Ya existe un PR abierto head->base?
+            // Evitar PR duplicado
             const existing = await github.rest.pulls.list({
               owner, repo, state: "open", base, head: `${owner}:${head}`
             });
@@ -53,18 +71,41 @@ jobs:
               return;
             }
 
-            // Asegura que head esté por delante de base
+            // Comparar commits
             const cmp = await github.rest.repos.compareCommits({ owner, repo, base, head });
             const ahead = cmp.data.ahead_by || 0;
-            if (ahead <= 0) {
-              core.notice(`${head} no está por delante de ${base}; no se crea PR.`);
+            const minAhead = parseInt(process.env.MIN_AHEAD || "1", 10);
+            if (ahead < minAhead) {
+              core.notice(`${head} solo está ${ahead} commit(s) por delante de ${base} (mínimo ${minAhead}). No se crea PR.`);
               return;
             }
 
-            const pr = await github.rest.pulls.create({
-              owner, repo, base, head,
-              title: `Promote ${head} -> ${base} (${ahead} commit${ahead===1?"":"s"})`,
-              body: "PR automático: se detectó la palabra exacta `PR` en un commit de este push."
-            });
+            // Crear PR
+            const title = `${process.env.PR_TITLE_PREFIX || "Promote"} ${head} -> ${base} (${ahead} commit${ahead===1?"":"s"})`;
+            const body  = [
+              "PR automático generado por GitHub Actions.",
+              `- Base: \`${base}\``,
+              `- Head: \`${head}\``,
+              `- Commits por delante: **${ahead}**`,
+              "",
+              `Condición: presencia de la palabra exacta \`${process.env.KEYWORD}\` en algún mensaje de commit.`
+            ].join("\n");
 
+            const pr = await github.rest.pulls.create({ owner, repo, base, head, title, body });
             core.notice(`PR creado: ${pr.data.html_url}`);
+
+            // Labels opcionales
+            const labels = (process.env.PR_LABELS || "").split(",").map(s => s.trim()).filter(Boolean);
+            if (labels.length) {
+              try {
+                await github.rest.issues.addLabels({ owner, repo, issue_number: pr.data.number, labels });
+              } catch (e) { core.warning(`No se pudieron añadir labels: ${e.message}`); }
+            }
+
+            // Reviewers opcionales
+            const reviewers = (process.env.PR_REVIEWERS || "").split(",").map(s => s.trim()).filter(Boolean);
+            if (reviewers.length) {
+              try {
+                await github.rest.pulls.requestReviewers({ owner, repo, pull_number: pr.data.number, reviewers });
+              } catch (e) { core.warning(`No se pudieron asignar reviewers: ${e.message}`); }
+            }
