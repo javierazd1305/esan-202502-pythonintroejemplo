@@ -1,111 +1,132 @@
-name: auto-pr-dev-to-main
+name: auto-pr-dev-to-main (debug)
 
 on:
   push:
-    branches: ["dev", "DEV"]   # escucha ambas variantes
+    branches: ["dev", "DEV"]   # cubre ambas
   workflow_dispatch: {}
 
-# Requiere habilitar en Settings → Actions → Workflow permissions:
-#   - Read and write permissions
-#   - Allow GitHub Actions to create and approve pull requests
 permissions:
   contents: read
   pull-requests: write
 
 env:
-  BASE_BRANCH: main            # rama destino
-  KEYWORD: PR                  # palabra exacta requerida en mensajes de commit
-  MIN_AHEAD: "1"               # mínimo de commits que dev debe llevarle a main
-  PR_TITLE_PREFIX: "Promote"   # prefijo del título del PR
-  PR_LABELS: "auto-pr,release" # (opcional) etiquetas separadas por coma; vacío = ninguna
-  PR_REVIEWERS: ""             # (opcional) reviewers separados por coma; vacío = ninguno
+  BASE_BRANCH: main     # destino
+  KEYWORD: PR           # palabra exacta requerida
+  MIN_AHEAD: "1"        # dev debe estar >= a esto por delante de main
 
 jobs:
   open-pr:
     runs-on: ubuntu-latest
     steps:
-      - name: Debug (ref y últimos mensajes)
-        uses: actions/github-script@v7
-        with:
-          script: |
-            core.info(`GITHUB_REF: ${process.env.GITHUB_REF}`);
-            core.info(`GITHUB_REF_NAME: ${process.env.GITHUB_REF_NAME}`);
-            const commits = context.payload.commits || [];
-            core.info("Mensajes del push:");
-            for (const c of commits) core.info(`- ${c.message}`);
+      - name: Contexto básico
+        run: |
+          echo "GITHUB_REF=$GITHUB_REF"
+          echo "GITHUB_REF_NAME=$GITHUB_REF_NAME"
+          echo "Evento: $GITHUB_EVENT_NAME"
 
-      - name: Gate por palabra clave exacta
-        id: gate
+      - name: Evaluar condiciones y recolectar debug
+        id: ctx
         uses: actions/github-script@v7
         with:
-          script: |
-            const commits = context.payload.commits || [];
-            const regex = new RegExp(String.raw`\\b${process.env.KEYWORD}\\b`); // sensible a mayúsculas
-            const hit = commits.some(c => regex.test(c.message || ""));
-            core.setOutput('open', hit ? 'true' : 'false');
-            core.info(`¿Contiene "${process.env.KEYWORD}"?: ${hit}`);
-
-      - name: Crear PR dev/DEV -> main (si pasa gate)
-        if: steps.gate.outputs.open == 'true'
-        uses: actions/github-script@v7
-        with:
-          # Si tu organización no permite que GITHUB_TOKEN cree PRs,
-          # crea un PAT con scope repo y guárdalo como GH_PAT:
-          github-token: ${{ secrets.GH_PAT != '' && secrets.GH_PAT || github.token }}
           script: |
             const { owner, repo } = context.repo;
             const base = process.env.BASE_BRANCH || "main";
-            const head = context.ref.replace("refs/heads/", ""); // dev o DEV
+            const head = context.ref.replace("refs/heads/", "");
 
-            if (head.toLowerCase() === base.toLowerCase()) {
-              core.notice("Push en la rama base: no se crea PR.");
-              return;
+            // Mensajes del push
+            const commits = context.payload.commits || [];
+            const headCommitMsg = (context.payload.head_commit || {}).message || "";
+            const allMsgs = [...commits.map(c => c.message || ""), headCommitMsg].filter(Boolean);
+
+            // Palabra exacta (sensible a mayúsculas)
+            const regex = new RegExp(String.raw`\\b${process.env.KEYWORD}\\b`);
+            const hit = allMsgs.some(m => regex.test(m));
+
+            // Comparación de commits (puede fallar si rama mal escrita)
+            let aheadBy = -1, behindBy = -1, reason = "";
+            try {
+              const cmp = await github.rest.repos.compareCommits({ owner, repo, base, head });
+              aheadBy  = cmp.data.ahead_by ?? -1;
+              behindBy = cmp.data.behind_by ?? -1;
+            } catch (e) {
+              reason = `compareCommits falló: ${e.message}`;
             }
 
-            // Evitar PR duplicado
-            const existing = await github.rest.pulls.list({
-              owner, repo, state: "open", base, head: `${owner}:${head}`
-            });
-            if (existing.data.length > 0) {
-              core.notice(`PR ya existe: ${existing.data[0].html_url}`);
-              return;
+            // ¿Ya existe un PR?
+            let existingUrl = "";
+            try {
+              const existing = await github.rest.pulls.list({
+                owner, repo, state: "open", base, head: `${owner}:${head}`
+              });
+              if (existing.data.length > 0) existingUrl = existing.data[0].html_url;
+            } catch (e) {
+              // ignorar
             }
 
-            // Comparar commits
-            const cmp = await github.rest.repos.compareCommits({ owner, repo, base, head });
-            const ahead = cmp.data.ahead_by || 0;
             const minAhead = parseInt(process.env.MIN_AHEAD || "1", 10);
-            if (ahead < minAhead) {
-              core.notice(`${head} solo está ${ahead} commit(s) por delante de ${base} (mínimo ${minAhead}). No se crea PR.`);
-              return;
+            let open = true;
+            if (head.toLowerCase() === base.toLowerCase()) {
+              open = false; reason = "push en rama base";
+            } else if (!hit) {
+              open = false; reason = `no se encontró la palabra exacta "${process.env.KEYWORD}"`;
+            } else if (reason) {
+              open = false; // ya seteado por compare error
+            } else if (aheadBy < minAhead) {
+              open = false; reason = `ahead_by=${aheadBy} < MIN_AHEAD=${minAhead}`;
+            } else if (existingUrl) {
+              open = false; reason = `PR ya existe: ${existingUrl}`;
             }
 
-            // Crear PR
-            const title = `${process.env.PR_TITLE_PREFIX || "Promote"} ${head} -> ${base} (${ahead} commit${ahead===1?"":"s"})`;
+            core.info(`Base=${base} Head=${head}`);
+            core.info(`Mensajes: ${JSON.stringify(allMsgs)}`);
+            core.info(`Keyword hit=${hit}  ahead_by=${aheadBy} behind_by=${behindBy}`);
+            if (reason) core.info(`Reason: ${reason}`);
+
+            core.setOutput("base", base);
+            core.setOutput("head", head);
+            core.setOutput("hit", String(hit));
+            core.setOutput("ahead_by", String(aheadBy));
+            core.setOutput("behind_by", String(behindBy));
+            core.setOutput("reason", reason);
+            core.setOutput("open", String(open));
+
+      - name: Crear PR (solo si procede)
+        if: steps.ctx.outputs.open == 'true'
+        uses: actions/github-script@v7
+        with:
+          # Si tu org prohíbe que GITHUB_TOKEN cree PRs, añade un secreto GH_PAT y descomenta la siguiente línea:
+          # github-token: ${{ secrets.GH_PAT }}
+          script: |
+            const { owner, repo } = context.repo;
+            const base = "${{ steps.ctx.outputs.base }}";
+            const head = "${{ steps.ctx.outputs.head }}";
+            const ahead = parseInt("${{ steps.ctx.outputs.ahead_by }}", 10);
+
+            const title = `Promote ${head} -> ${base} (${ahead} commit${ahead===1?"":"s"})`;
             const body  = [
               "PR automático generado por GitHub Actions.",
               `- Base: \`${base}\``,
               `- Head: \`${head}\``,
               `- Commits por delante: **${ahead}**`,
               "",
-              `Condición: presencia de la palabra exacta \`${process.env.KEYWORD}\` en algún mensaje de commit.`
+              `Condición: presencia de la palabra exacta \`${process.env.KEYWORD}\` en al menos un mensaje de commit.`
             ].join("\n");
 
             const pr = await github.rest.pulls.create({ owner, repo, base, head, title, body });
             core.notice(`PR creado: ${pr.data.html_url}`);
+            core.setOutput("pr_url", pr.data.html_url);
 
-            // Labels opcionales
-            const labels = (process.env.PR_LABELS || "").split(",").map(s => s.trim()).filter(Boolean);
-            if (labels.length) {
-              try {
-                await github.rest.issues.addLabels({ owner, repo, issue_number: pr.data.number, labels });
-              } catch (e) { core.warning(`No se pudieron añadir labels: ${e.message}`); }
-            }
-
-            // Reviewers opcionales
-            const reviewers = (process.env.PR_REVIEWERS || "").split(",").map(s => s.trim()).filter(Boolean);
-            if (reviewers.length) {
-              try {
-                await github.rest.pulls.requestReviewers({ owner, repo, pull_number: pr.data.number, reviewers });
-              } catch (e) { core.warning(`No se pudieron asignar reviewers: ${e.message}`); }
-            }
+      - name: Resumen (siempre)
+        if: always()
+        run: |
+          {
+            echo "### Auto PR debug"
+            echo ""
+            echo "- Base: \`${{ steps.ctx.outputs.base }}\`"
+            echo "- Head: \`${{ steps.ctx.outputs.head }}\`"
+            echo "- Keyword encontrada: \`${{ steps.ctx.outputs.hit }}\` (KEYWORD=${KEYWORD})"
+            echo "- ahead_by: \`${{ steps.ctx.outputs.ahead_by }}\`"
+            echo "- behind_by: \`${{ steps.ctx.outputs.behind_by }}\`"
+            echo "- Abrir PR: \`${{ steps.ctx.outputs.open }}\`"
+            echo "- Motivo (si no abre): \`${{ steps.ctx.outputs.reason || '—' }}\`"
+          } >> $GITHUB_STEP_SUMMARY
