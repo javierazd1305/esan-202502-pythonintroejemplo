@@ -1,0 +1,65 @@
+name: Auto PR dev -> main (palabra PR)
+
+on:
+  push:
+    branches: ["dev"]        # se dispara al pushear a dev
+  workflow_dispatch: {}      # opcional: lanzarlo manualmente
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  auto-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verificar si el mensaje contiene la palabra exacta "PR"
+        id: gate
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Revisa TODOS los commits del push
+            const commits = context.payload.commits || [];
+            // "PR" como palabra exacta (sensible a mayúsculas)
+            const regex = /\bPR\b/;
+            const hit = commits.some(c => regex.test(c.message));
+
+            if (!hit) {
+              core.notice('No se encontró la palabra exacta "PR" en los mensajes del push. No se abrirá PR.');
+              core.setOutput('open', 'false');
+              return;
+            }
+            core.setOutput('open', 'true');
+
+      - name: Crear PR dev -> main (si pasa el gate)
+        if: steps.gate.outputs.open == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const base = "main";
+            const head = "dev";
+
+            // Evitar PRs duplicados
+            const existing = await github.rest.pulls.list({
+              owner, repo, state: "open", base, head: `${owner}:${head}`
+            });
+            if (existing.data.length > 0) {
+              core.notice(`PR ya existe: ${existing.data[0].html_url}`);
+              return;
+            }
+
+            // Asegurar que dev esté por delante
+            const cmp = await github.rest.repos.compareCommits({ owner, repo, base, head });
+            if (cmp.data.ahead_by <= 0) {
+              core.notice("dev no está por delante de main; no se crea PR.");
+              return;
+            }
+
+            const pr = await github.rest.pulls.create({
+              owner, repo, base, head,
+              title: `Promote DEV -> MAIN (${cmp.data.ahead_by} commits)`,
+              body: "PR automático: se detectó la palabra exacta `PR` en un commit de este push."
+            });
+
+            core.notice(`PR creado: ${pr.data.html_url}`);
