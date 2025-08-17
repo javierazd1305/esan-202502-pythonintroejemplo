@@ -1,9 +1,9 @@
-name: Auto PR dev -> main (palabra PR)
+name: Auto PR -> main (requiere palabra PR)
 
 on:
   push:
-    branches: ["dev", "DEV"]        # se dispara al pushear a dev
-  workflow_dispatch: {}      # opcional: lanzarlo manualmente
+    branches: ["dev", "DEV"]   # escucha ambas variantes
+  workflow_dispatch: {}        # permite correrlo manualmente
 
 permissions:
   contents: read
@@ -13,34 +13,38 @@ jobs:
   auto-pr:
     runs-on: ubuntu-latest
     steps:
-      - name: Verificar si el mensaje contiene la palabra exacta "PR"
+      - name: Debug ref
+        run: |
+          echo "GITHUB_REF=$GITHUB_REF"
+          echo "GITHUB_REF_NAME=$GITHUB_REF_NAME"
+
+      - name: Gate por mensaje que contenga la palabra exacta PR
         id: gate
         uses: actions/github-script@v7
         with:
           script: |
-            // Revisa TODOS los commits del push
             const commits = context.payload.commits || [];
-            // "PR" como palabra exacta (sensible a mayúsculas)
-            const regex = /\bPR\b/;
-            const hit = commits.some(c => regex.test(c.message));
+            const hit = commits.some(c => /\bPR\b/.test(c.message)); // sensible a mayúsculas
+            core.setOutput('open', hit ? 'true' : 'false');
+            core.info(`Gate (tiene PR?): ${hit}`);
 
-            if (!hit) {
-              core.notice('No se encontró la palabra exacta "PR" en los mensajes del push. No se abrirá PR.');
-              core.setOutput('open', 'false');
-              return;
-            }
-            core.setOutput('open', 'true');
-
-      - name: Crear PR dev -> main (si pasa el gate)
+      - name: Crear PR hacia main si pasa el gate
         if: steps.gate.outputs.open == 'true'
         uses: actions/github-script@v7
         with:
           script: |
             const { owner, repo } = context.repo;
             const base = "main";
-            const head = "dev";
+            // rama actual del push (p.ej., "DEV" o "dev")
+            const head = context.ref.replace('refs/heads/', '');
+            core.info(`Base=${base}  Head=${head}`);
 
-            // Evitar PRs duplicados
+            if (head.toLowerCase() === base.toLowerCase()) {
+              core.notice("Estás en main; no tiene sentido abrir PR.");
+              return;
+            }
+
+            // ¿Ya existe un PR abierto head->base?
             const existing = await github.rest.pulls.list({
               owner, repo, state: "open", base, head: `${owner}:${head}`
             });
@@ -49,16 +53,17 @@ jobs:
               return;
             }
 
-            // Asegurar que dev esté por delante
+            // Asegura que head esté por delante de base
             const cmp = await github.rest.repos.compareCommits({ owner, repo, base, head });
-            if (cmp.data.ahead_by <= 0) {
-              core.notice("dev no está por delante de main; no se crea PR.");
+            const ahead = cmp.data.ahead_by || 0;
+            if (ahead <= 0) {
+              core.notice(`${head} no está por delante de ${base}; no se crea PR.`);
               return;
             }
 
             const pr = await github.rest.pulls.create({
               owner, repo, base, head,
-              title: `Promote DEV -> MAIN (${cmp.data.ahead_by} commits)`,
+              title: `Promote ${head} -> ${base} (${ahead} commit${ahead===1?"":"s"})`,
               body: "PR automático: se detectó la palabra exacta `PR` en un commit de este push."
             });
 
