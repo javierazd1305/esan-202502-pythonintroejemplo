@@ -64,8 +64,9 @@ jobs:
       # Si prefieres no borrar, elimina este paso.
       - name: Limpiar destino (opcional)
         run: |
-          databricks workspace delete -r "${{ steps.target.outputs.dir }}" || true
+          databricks workspace delete --recursive "${{ steps.target.outputs.dir }}" || true
           databricks workspace mkdirs "${{ steps.target.outputs.dir }}"
+
 
       # Importar TODO el repo (archivos soportados: .ipynb, .py, .sql, .scala, etc.)
       # --exclude-hidden evita subir .github/ y otros dotfiles
