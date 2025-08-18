@@ -1,82 +1,84 @@
-name: copy-main-to-databricks
+name: deploy-main-to-dbx
 
 on:
-  pull_request:
-    types: [closed]     # solo cuando se cierra la PR
-    branches: [main]    # y la base es main
-  workflow_dispatch: {} # opción de lanzarlo manualmente
+  push:
+    branches: [ "main" ]      # corre al merge/push en main
+  workflow_dispatch: {}        # permite lanzarlo manualmente
 
 permissions:
   contents: read
 
 jobs:
-  copy:
-    # corre SOLO si la PR fue MERGEADA (no cerrada sin merge)
-    if: github.event.pull_request.merged == true
+  deploy:
     runs-on: ubuntu-latest
 
+    # === Configuración vía Secrets/Variables ===
+    # Secrets: Settings → Secrets and variables → Actions → Secrets
+    #   - DATABRICKS_HOST (https://adb-xxxx.cloud.databricks.com)
+    #   - DATABRICKS_TOKEN (PAT con permisos de Workspace)
+    # Variables: Settings → Secrets and variables → Actions → Variables (opcionales)
+    #   - PROJ (ej: mi-proyecto)
+    #   - BASE_DIR (ej: /Shared/projects)
     env:
-      # Secrets necesarios (Configúralos en: Settings → Secrets and variables → Actions)
       DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
       DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-
-      # Parametrización
-      PROJ: tu-proyecto                             # nombre lógico del proyecto
-      # Ruta destino en el Workspace (prod). Mantén el formato que ya te funciona.
-      TARGET_SUBPATH: /Shared/projects/${PROJ}/prod
-
-      # (Opcional) Restringir a merges que vengan de dev/DEV solamente:
-      ONLY_FROM_DEV: "false"   # pon "true" si quieres limitarlo
+      PROJ: ${{ vars.PROJ || 'tu-proyecto' }}
+      BASE_DIR: ${{ vars.BASE_DIR || '/Shared/projects' }}
 
     steps:
-      - name: Validar origen (opcional)
-        if: env.ONLY_FROM_DEV == 'true'
-        run: |
-          HEAD_REF="${{ github.event.pull_request.head.ref }}"
-          if [ "$HEAD_REF" != "dev" ] && [ "$HEAD_REF" != "DEV" ]; then
-            echo "Merge viene de $HEAD_REF y ONLY_FROM_DEV=true. Saliendo sin hacer deploy."
-            exit 0
-          fi
-
-      - name: Checkout main (último estado tras el merge)
+      - name: Checkout main
         uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
 
-      # Instala el CLI unificado de Databricks (usa el mismo action que ya te funcionó)
-      - name: Install Databricks CLI
+      - name: Instalar Databricks CLI
         uses: databricks/setup-cli@main
 
-      - name: Smoke básico
+      - name: Verificar auth (debug)
         run: |
+          set -e
+          [ -n "$DATABRICKS_HOST" ] || (echo "❌ Falta DATABRICKS_HOST" && exit 1)
+          [ -n "$DATABRICKS_TOKEN" ] || (echo "❌ Falta DATABRICKS_TOKEN" && exit 1)
+          echo "✔ Secrets presentes."
           databricks --version
           databricks current-user me || true
           databricks workspace list / || true
 
       - name: Resolver ruta destino
-        id: target
+        id: path
         run: |
-          echo "dir=${TARGET_SUBPATH}" >> $GITHUB_OUTPUT
-          echo "Destino: ${TARGET_SUBPATH}"
+          set -e
+          DEST="$BASE_DIR/$PROJ/prod"
+          echo "dir=$DEST" >> "$GITHUB_OUTPUT"
+          echo "Destino: $DEST"
 
-      # (Opcional) limpiar destino para evitar archivos huérfanos
-      # Si prefieres no borrar, elimina este paso.
-      - name: Limpiar destino (opcional)
+      - name: Preparar destino (limpiar y crear)
         run: |
-          databricks workspace delete --recursive "${{ steps.target.outputs.dir }}" || true
-          databricks workspace mkdirs "${{ steps.target.outputs.dir }}"
+          set -e
+          databricks workspace delete --recursive "${{ steps.path.outputs.dir }}" || true
+          databricks workspace mkdirs "${{ steps.path.outputs.dir }}"
 
-
-      # Importar TODO el repo (archivos soportados: .ipynb, .py, .sql, .scala, etc.)
-      # --exclude-hidden evita subir .github/ y otros dotfiles
       - name: Importar repo a Databricks (prod)
         run: |
+          set -e
+          # Sube todos los tipos soportados (.ipynb, .py, .sql, .scala, etc.)
+          # --exclude-hidden evita dotfiles como .github/
           databricks workspace import-dir \
             --exclude-hidden \
             --overwrite \
-            . "${{ steps.target.outputs.dir }}"
+            . "${{ steps.path.outputs.dir }}"
 
-      - name: Ver contenido final
+      - name: Listar contenido final
         run: |
-          databricks workspace list "${{ steps.target.outputs.dir }}"
+          databricks workspace list "${{ steps.path.outputs.dir }}"
+
+      - name: Resumen
+        if: always()
+        run: |
+          {
+            echo "### Deploy a Databricks"
+            echo "- Destino: \`${{ steps.path.outputs.dir }}\`"
+            echo "- Proyecto: \`${PROJ}\`"
+            echo "- Base dir: \`${BASE_DIR}\`"
+          } >> $GITHUB_STEP_SUMMARY
