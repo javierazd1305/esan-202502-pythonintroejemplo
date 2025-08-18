@@ -12,11 +12,11 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
 
-    # === Configuración vía Secrets/Variables ===
-    # Secrets: Settings → Secrets and variables → Actions → Secrets
+    # === Config vía Secrets/Variables ===
+    # Secrets (Settings → Secrets and variables → Actions → Secrets):
     #   - DATABRICKS_HOST (https://adb-xxxx.cloud.databricks.com)
     #   - DATABRICKS_TOKEN (PAT con permisos de Workspace)
-    # Variables: Settings → Secrets and variables → Actions → Variables (opcionales)
+    # Variables (opcionales):
     #   - PROJ (ej: mi-proyecto)
     #   - BASE_DIR (ej: /Shared/projects)
     env:
@@ -59,15 +59,31 @@ jobs:
           databricks workspace delete --recursive "${{ steps.path.outputs.dir }}" || true
           databricks workspace mkdirs "${{ steps.path.outputs.dir }}"
 
+      # ==== NUEVO: Staging sin dotfiles ====
+      - name: Instalar rsync (si falta) y preparar staging
+        run: |
+          set -e
+          if ! command -v rsync >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y rsync
+          fi
+          mkdir -p /tmp/ws_src
+          rsync -a ./ /tmp/ws_src \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='.gitignore' \
+            --exclude='.gitattributes' \
+            --exclude='.vscode' \
+            --exclude='.idea' \
+            --exclude='__pycache__' \
+            --exclude='.DS_Store'
+
       - name: Importar repo a Databricks (prod)
         run: |
           set -e
-          # Sube todos los tipos soportados (.ipynb, .py, .sql, .scala, etc.)
-          # --exclude-hidden evita dotfiles como .github/
+          # Importa desde el staging (sin dotfiles) al Workspace
           databricks workspace import-dir \
-            --exclude-hidden \
             --overwrite \
-            . "${{ steps.path.outputs.dir }}"
+            /tmp/ws_src "${{ steps.path.outputs.dir }}"
 
       - name: Listar contenido final
         run: |
